@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/binary"
@@ -13,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -45,31 +45,31 @@ var (
 	ErrBadVersion   = E.New("bad version")
 )
 
+type userIdCipher[U comparable] struct {
+	userId U
+	cipher cipher.Block
+}
+
 type Service[U comparable] struct {
+	userIndexCache       map[int]int64
+	cacheLock            sync.Mutex
 	userKey              map[U][16]byte
-	userIdCipher         map[U]cipher.Block
+	userIdCipher         []userIdCipher[U]
 	replayFilter         replay.Filter
 	handler              Handler
 	time                 func() time.Time
+	ticker               *time.Ticker
+	done                 chan struct{}
 	disableHeaderProtect bool
-	alterIds             map[U][][16]byte
-	alterIdUpdateTime    map[U]int64
-	alterIdMap           map[[16]byte]legacyUserEntry[U]
-	alterIdUpdateTask    *time.Ticker
-	alterIdUpdateDone    chan struct{}
-}
-
-type legacyUserEntry[U comparable] struct {
-	User  U
-	Time  int64
-	Index int
 }
 
 func NewService[U comparable](handler Handler, options ...ServiceOption) *Service[U] {
 	service := &Service[U]{
-		replayFilter: replay.NewSimple(time.Second * 120),
-		handler:      handler,
-		time:         time.Now,
+		userIndexCache: map[int]int64{},
+		replayFilter:   replay.NewSimple(time.Second * 120),
+		handler:        handler,
+		time:           time.Now,
+		done:           make(chan struct{}),
 	}
 	anyService := (*Service[string])(unsafe.Pointer(service))
 	for _, option := range options {
@@ -80,7 +80,7 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 
 func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList []int) error {
 	userKeyMap := make(map[U][16]byte)
-	userIdCipherMap := make(map[U]cipher.Block)
+	userIdCiphers := make([]userIdCipher[U], len(userList))
 	userAlterIds := make(map[U][][16]byte)
 	for i, user := range userList {
 		userId := userIdList[i]
@@ -90,11 +90,14 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 		}
 		userCmdKey := Key(userUUID)
 		userKeyMap[user] = userCmdKey
-		userIdCipher, err := aes.NewCipher(KDF(userCmdKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
+		cp, err := aes.NewCipher(KDF(userCmdKey[:], KDFSaltConstAuthIDEncryptionKey)[:16])
 		if err != nil {
 			return err
 		}
-		userIdCipherMap[user] = userIdCipher
+		userIdCiphers[i] = userIdCipher[U]{
+			userId: user,
+			cipher: cp,
+		}
 		alterId := alterIdList[i]
 		if alterId > 0 {
 			alterIds := make([][16]byte, 0, alterId)
@@ -107,77 +110,45 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 		}
 	}
 	s.userKey = userKeyMap
-	s.userIdCipher = userIdCipherMap
-	s.alterIds = userAlterIds
-	s.alterIdUpdateTime = make(map[U]int64)
-	s.generateLegacyKeys()
+	s.userIdCipher = userIdCiphers
+	s.cacheLock.Lock()
+	s.userIndexCache = map[int]int64{}
+	s.cacheLock.Unlock()
 	return nil
 }
 
 func (s *Service[U]) Start() error {
-	const updateInterval = 10 * time.Second
-	if len(s.alterIds) > 0 {
-		s.alterIdUpdateTask = time.NewTicker(updateInterval)
-		s.alterIdUpdateDone = make(chan struct{})
-		go s.loopGenerateLegacyKeys()
-	}
+	s.ticker = time.NewTicker(time.Minute * 20)
 	return nil
 }
 
 func (s *Service[U]) Close() error {
-	if s.alterIdUpdateTask != nil {
-		s.alterIdUpdateTask.Stop()
-		close(s.alterIdUpdateDone)
-	}
+	s.ticker.Stop()
+	close(s.done)
 	return nil
 }
 
-func (s *Service[U]) loopGenerateLegacyKeys() {
+func (s *Service[U]) loopClearCache() {
 	for {
 		select {
-		case <-s.alterIdUpdateDone:
+		case <-s.ticker.C:
+		case <-s.done:
 			return
-		case <-s.alterIdUpdateTask.C:
 		}
-		s.generateLegacyKeys()
-	}
-}
-
-func (s *Service[U]) generateLegacyKeys() {
-	nowSec := s.time().Unix()
-	endSec := nowSec + CacheDurationSeconds
-	var hashValue [16]byte
-
-	userAlterIdMap := make(map[[16]byte]legacyUserEntry[U])
-	userAlterIdUpdateTime := make(map[U]int64)
-
-	for user, alterIds := range s.alterIds {
-		beginSec := s.alterIdUpdateTime[user]
-		if beginSec < nowSec-CacheDurationSeconds {
-			beginSec = nowSec - CacheDurationSeconds
-		}
-		for i, alterId := range alterIds {
-			idHash := hmac.New(md5.New, alterId[:])
-			for ts := beginSec; ts <= endSec; ts++ {
-				common.Must(binary.Write(idHash, binary.BigEndian, uint64(ts)))
-				idHash.Sum(hashValue[:0])
-				idHash.Reset()
-				userAlterIdMap[hashValue] = legacyUserEntry[U]{user, ts, i}
+		for i, t := range s.userIndexCache {
+			if time.Now().Unix() > t {
+				s.cacheLock.Lock()
+				delete(s.userIndexCache, i)
+				s.cacheLock.Unlock()
 			}
 		}
-		userAlterIdUpdateTime[user] = nowSec
 	}
-	s.alterIdUpdateTime = userAlterIdUpdateTime
-	s.alterIdMap = userAlterIdMap
 }
 
 func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
 	const headerLenBufferLen = 2 + CipherOverhead
 	const aeadMinHeaderLen = 16 + headerLenBufferLen + 8 + CipherOverhead + 42
 	minHeaderLen := aeadMinHeaderLen
-	if len(s.alterIds) > 0 {
-		minHeaderLen = 16 + 38
-	}
 
 	requestBuffer := buf.New()
 	defer requestBuffer.Release()
@@ -201,8 +172,8 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 	var decodedId [16]byte
 	var user U
 	var found bool
-	for currUser, userIdBlock := range s.userIdCipher {
-		userIdBlock.Decrypt(decodedId[:], authId)
+	for i, t := range s.userIndexCache {
+		s.userIdCipher[i].cipher.Decrypt(decodedId[:], authId)
 		timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
 		checksum := binary.BigEndian.Uint32(decodedId[12:])
 		if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
@@ -214,22 +185,42 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 		if !s.replayFilter.Check(decodedId[:]) {
 			return ErrReplay
 		}
-		user = currUser
+		user = s.userIdCipher[i].userId
 		found = true
+		if time.Now().Add(8*time.Minute).Unix() > t {
+			s.cacheLock.Lock()
+			s.userIndexCache[i] = time.Now().Add(30 * time.Minute).Unix()
+			s.cacheLock.Unlock()
+		}
 		break
 	}
-
-	var legacyProtocol bool
-	var legacyTimestamp uint64
 	if !found {
-		copy(decodedId[:], authId)
-		if currUser, loaded := s.alterIdMap[decodedId]; loaded {
+		for i, u := range s.userIdCipher {
+			if _, e := s.userIndexCache[i]; e {
+				continue
+			}
+			u.cipher.Decrypt(decodedId[:], authId)
+			timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
+			checksum := binary.BigEndian.Uint32(decodedId[12:])
+			if crc32.ChecksumIEEE(decodedId[:12]) != checksum {
+				continue
+			}
+			if math.Abs(math.Abs(float64(timestamp))-float64(time.Now().Unix())) > 120 {
+				return ErrBadTimestamp
+			}
+			if !s.replayFilter.Check(decodedId[:]) {
+				return ErrReplay
+			}
+			user = u.userId
 			found = true
-			legacyProtocol = true
-			user = currUser.User
-			legacyTimestamp = uint64(currUser.Time)
+			s.cacheLock.Lock()
+			s.userIndexCache[i] = time.Now().Add(30 * time.Minute).Unix()
+			s.cacheLock.Unlock()
+			break
 		}
 	}
+	var legacyProtocol bool
+	var legacyTimestamp uint64
 	if !found {
 		return ErrBadRequest
 	}
